@@ -33,7 +33,7 @@ static const int ADC_BUTTON_SAMPLES = 16; // průměr proti šumu ADC
 // Kalibrace tlačítek: na Serial každých 500 ms vypíše surovou hodnotu ADC (0..4095).
 // Po doladění prahů nastav na 0 a znovu nahraj firmware.
 #ifndef PRINT_ADC_CALIBRATION
-#define PRINT_ADC_CALIBRATION 1
+#define PRINT_ADC_CALIBRATION 0
 #endif
 static const unsigned long ADC_CALIB_PRINT_MS = 500;
 static unsigned long lastAdcCalibPrintMs = 0;
@@ -64,6 +64,8 @@ Preferences prefs;
 String wifiSsid;
 String wifiPass;
 bool apMode = false;
+bool prefForceAp = false; // preferovaný režim (true = AP, false = Klient)
+bool wifiModeChanged = false; // příznak změny režimu pro restart po opuštění menu
 
 int schedOnHour = 8;
 int schedOnMinute = 0;
@@ -89,7 +91,6 @@ unsigned long lastUserActivityMs = 0;
 // Pro CZ použij "CET-1CEST,M3.5.0/2,M10.5.0/3"
 static const char *TZ_INFO = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 static const unsigned long NTP_SYNC_INTERVAL_MS = 60UL * 60UL * 1000UL; // 1h
-static const unsigned long IDLE_TO_TEMP_SCREEN_MS = 15000UL;
 
 // -----------------------------
 // Button handling (ADC ladder)
@@ -106,10 +107,12 @@ struct ButtonState {
   ButtonId stableBtn = BTN_NONE;
   ButtonId rawBtn = BTN_NONE;
   unsigned long changedMs = 0;
+  bool longPressHandled = false;
 };
 
 ButtonState btn;
 static const unsigned long BUTTON_DEBOUNCE_MS = 40;
+static const unsigned long BUTTON_LONG_PRESS_MS = 1000;
 
 // ADC thresholds (12-bit ADC, 0..4095).
 // Dle reálných odporů je potřeba případně doladit.
@@ -366,7 +369,9 @@ static const uint8_t *const epd_bitmap_digits[10] = {
 enum UiScreen {
   SCREEN_HOME = 0,
   SCREEN_TIMER,
-  SCREEN_TEMP_FULL
+  SCREEN_TEMP_FULL,
+  SCREEN_SETTINGS,
+  SCREEN_INFO
 };
 
 enum TimerEditPart {
@@ -378,6 +383,11 @@ enum TimerEditPart {
 UiScreen uiScreen = SCREEN_HOME;
 int timerSelectedRow = 0; // 0=ON, 1=OFF, 2=Aktivni
 TimerEditPart timerEditPart = TIMER_EDIT_NONE;
+
+int settingsSelectedRow = 0; // 0=WifiMode, 1=FullscreenTemp
+int fullscreenTimeoutIdx = 1; // default 15s (index 1)
+static const int FULLSCREEN_TIMEOUTS[] = {0, 15000, 30000, 45000, 60000};
+static const char* FULLSCREEN_TIMEOUT_LABELS[] = {"OFF", "15s", "30s", "45s", "60s"};
 
 // -----------------------------
 // Utility
@@ -456,6 +466,8 @@ void loadSettings() {
   schedOffHour = prefs.getInt("offH", 18);
   schedOffMinute = prefs.getInt("offM", 0);
   timerEnabled = prefs.getBool("timerEn", true);
+  prefForceAp = prefs.getBool("forceAp", false);
+  fullscreenTimeoutIdx = prefs.getInt("fsTmo", 1);
   wifiSsid = prefs.getString("ssid", "");
   wifiPass = prefs.getString("pass", "");
   prefs.end();
@@ -464,6 +476,7 @@ void loadSettings() {
   schedOffHour = constrain(schedOffHour, 0, 23);
   schedOnMinute = constrain(schedOnMinute, 0, 59);
   schedOffMinute = constrain(schedOffMinute, 0, 59);
+  fullscreenTimeoutIdx = constrain(fullscreenTimeoutIdx, 0, 4);
 }
 
 void saveSchedule() {
@@ -473,6 +486,18 @@ void saveSchedule() {
   prefs.putInt("offH", schedOffHour);
   prefs.putInt("offM", schedOffMinute);
   prefs.putBool("timerEn", timerEnabled);
+  prefs.end();
+}
+
+void saveWifiMode() {
+  prefs.begin("poolctl", false);
+  prefs.putBool("forceAp", prefForceAp);
+  prefs.end();
+}
+
+void saveFullscreenSettings() {
+  prefs.begin("poolctl", false);
+  prefs.putInt("fsTmo", fullscreenTimeoutIdx);
   prefs.end();
 }
 
@@ -543,6 +568,7 @@ ButtonId readButtonRaw() {
 }
 
 void processShortPress(ButtonId b);
+void processLongPress(ButtonId b);
 
 void updateButtons() {
   ButtonId nowRaw = readButtonRaw();
@@ -551,6 +577,7 @@ void updateButtons() {
   if (nowRaw != btn.rawBtn) {
     btn.rawBtn = nowRaw;
     btn.changedMs = nowMs;
+    // btn.longPressHandled = false; // Toto se nesmí mazat při každé změně raw, ale až při uvolnění!
   }
 
   if ((nowMs - btn.changedMs) < BUTTON_DEBOUNCE_MS) return;
@@ -559,9 +586,18 @@ void updateButtons() {
     // state changed after debounce
     if (btn.stableBtn != BTN_NONE && btn.rawBtn == BTN_NONE) {
       // released
-      processShortPress(btn.stableBtn);
+      if (!btn.longPressHandled) {
+        processShortPress(btn.stableBtn);
+      }
+      btn.longPressHandled = false; // reset flag po uvolnění
     }
     btn.stableBtn = btn.rawBtn;
+  } else if (btn.stableBtn != BTN_NONE && !btn.longPressHandled) {
+    // still held
+    if ((nowMs - btn.changedMs) >= BUTTON_LONG_PRESS_MS) {
+      btn.longPressHandled = true;
+      processLongPress(btn.stableBtn);
+    }
   }
 }
 
@@ -626,12 +662,23 @@ void noteUserActivity() {
   lastUserActivityMs = millis();
 }
 
-/** Po 15 s bez stisku tlačítka přejde z hlavní obrazovky nebo časovače na celoobrazovkovou teplotu. */
+/** Po nastaveném čase bez stisku tlačítka přejde z hlavní obrazovky nebo časovače na celoobrazovkovou teplotu. */
 void checkIdleToTempScreen() {
   if (uiScreen == SCREEN_TEMP_FULL) return;
   if (uiScreen != SCREEN_HOME && uiScreen != SCREEN_TIMER) return;
-  if (millis() - lastUserActivityMs < IDLE_TO_TEMP_SCREEN_MS) return;
+  
+  int timeoutMs = FULLSCREEN_TIMEOUTS[fullscreenTimeoutIdx];
+  if (timeoutMs <= 0) return; // OFF
+
+  if (millis() - lastUserActivityMs < (unsigned long)timeoutMs) return;
   uiScreen = SCREEN_TEMP_FULL;
+}
+
+void processLongPress(ButtonId b) {
+  noteUserActivity();
+  if (uiScreen == SCREEN_HOME && b == BTN_4) {
+    uiScreen = SCREEN_SETTINGS;
+  }
 }
 
 void processShortPress(ButtonId b) {
@@ -639,6 +686,53 @@ void processShortPress(ButtonId b) {
 
   if (uiScreen == SCREEN_TEMP_FULL) {
     uiScreen = SCREEN_HOME;
+    return;
+  }
+
+  if (uiScreen == SCREEN_SETTINGS) {
+    if (b == BTN_1) {
+      if (wifiModeChanged) {
+        display.clearDisplay();
+        display.setCursor(24, 28);
+        display.print("Restartuji...");
+        display.display();
+        delay(1000);
+        ESP.restart();
+      }
+      uiScreen = SCREEN_HOME;
+    } else if (b == BTN_2) {
+      uiScreen = SCREEN_INFO;
+    } else if (b == BTN_3) {
+      settingsSelectedRow = (settingsSelectedRow + 1) % 2;
+    } else if (b == BTN_4) {
+      if (settingsSelectedRow == 0) {
+        prefForceAp = !prefForceAp;
+        wifiModeChanged = !wifiModeChanged; // toggle flag (při sudém počtu změn se nerestartuje)
+        saveWifiMode();
+      } else if (settingsSelectedRow == 1) {
+        fullscreenTimeoutIdx = (fullscreenTimeoutIdx + 1) % 5;
+        saveFullscreenSettings();
+      }
+    }
+    return;
+  }
+
+  if (uiScreen == SCREEN_INFO) {
+    if (b == BTN_1) {
+      if (wifiModeChanged) {
+        display.clearDisplay();
+        display.setCursor(0, 20);
+        display.print("Restartuji...");
+        display.display();
+        delay(1000);
+        ESP.restart();
+      }
+      uiScreen = SCREEN_HOME;
+    } else if (b == BTN_2) {
+      uiScreen = SCREEN_SETTINGS;
+    } else if (b == BTN_3) {
+      // arrowDown - placeholder
+    }
     return;
   }
 
@@ -856,8 +950,8 @@ void drawTimerScreen() {
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
 
-  display.setCursor(0, 0);
-  display.print("Casovac");
+  display.setCursor(36, 0);
+  display.print("-CASOVAC-");
 
   drawLabeledTimeRow("ON", 14, schedOnHour, schedOnMinute, timerSelectedRow == 0, timerSelectedRow == 0 && timerEditPart == TIMER_EDIT_HOUR, timerSelectedRow == 0 && timerEditPart == TIMER_EDIT_MINUTE);
   drawLabeledTimeRow("OFF", 26, schedOffHour, schedOffMinute, timerSelectedRow == 1, timerSelectedRow == 1 && timerEditPart == TIMER_EDIT_HOUR, timerSelectedRow == 1 && timerEditPart == TIMER_EDIT_MINUTE);
@@ -881,6 +975,67 @@ void drawTimerScreen() {
   display.display();
 }
 
+void drawSettingsScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  display.setCursor(6, 0);
+  display.print("-NASTAVENI SYSTEMU-");
+
+  // Radek 0: Rezim WiFi
+  if (settingsSelectedRow == 0) {
+    display.fillRect(0, 14, SCREEN_WIDTH, 10, SH110X_WHITE);
+    display.setTextColor(SH110X_BLACK);
+  } else {
+    display.setTextColor(SH110X_WHITE);
+  }
+  display.setCursor(0, 15);
+  display.print("Rezim WiFi: ");
+  display.print(prefForceAp ? "AP" : "Klient");
+
+  // Radek 1: Fullscreen temp
+  if (settingsSelectedRow == 1) {
+    display.fillRect(0, 24, SCREEN_WIDTH, 10, SH110X_WHITE);
+    display.setTextColor(SH110X_BLACK);
+  } else {
+    display.setTextColor(SH110X_WHITE);
+  }
+  display.setCursor(0, 25);
+  display.print("Fullscreen temp: ");
+  display.print(FULLSCREEN_TIMEOUT_LABELS[fullscreenTimeoutIdx]);
+
+  display.setTextColor(SH110X_WHITE);
+
+  drawSoftkeys(bitmap_back, bitmap_arrowRight, bitmap_arrowDown, bitmap_ok);
+  display.display();
+}
+
+void drawInfoScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  display.setCursor(30, 0);
+  display.print("-INFORMACE-");
+
+  display.setCursor(0, 14);
+  display.print(apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString());
+
+  display.setCursor(0, 24);
+  display.print(WiFi.macAddress());
+
+  display.setCursor(0, 34);
+  if (apMode) {
+    display.print("PoolControlSetup");
+  } else {
+    display.print(WiFi.SSID().length() > 0 ? WiFi.SSID() : "WIFI Nepripojena");
+  }
+
+  drawSoftkeys(bitmap_back, bitmap_arrowRight, bitmap_arrowDown, nullptr);
+  display.display();
+}
+
 void updateDisplay() {
   if (millis() - lastDisplayMs < 250) return;
   lastDisplayMs = millis();
@@ -889,6 +1044,10 @@ void updateDisplay() {
     drawHomeScreen();
   } else if (uiScreen == SCREEN_TIMER) {
     drawTimerScreen();
+  } else if (uiScreen == SCREEN_SETTINGS) {
+    drawSettingsScreen();
+  } else if (uiScreen == SCREEN_INFO) {
+    drawInfoScreen();
   } else {
     drawWaterTempFullScreen();
   }
@@ -1056,21 +1215,32 @@ void setup() {
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SH110X_WHITE);
-    display.setCursor(0, 0);
-    display.print("Booting...");
+    display.setCursor(18, 28);
+    display.print("Inicializace...");
     display.display();
   }
 
-  bool connected = connectSta();
-  if (connected) {
-    apMode = false;
-    // ---- IP address output to Serial added here ----
-    Serial.print("WiFi connected, IP address: ");
-    Serial.println(WiFi.localIP());
-    // ------------------------------------------------
-    syncTimeNow();
-  } else {
+  bool connected = false;
+  if (prefForceAp) {
     startApMode();
+  } else {
+    apMode = false;
+    connected = connectSta();
+    if (connected) {
+      Serial.print("WiFi connected, IP address: ");
+      Serial.println(WiFi.localIP());
+      syncTimeNow();
+    } else {
+      Serial.println("WiFi not connected, will retry in loop...");
+
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SH110X_WHITE);
+      display.setCursor(12, 28);
+      display.print("WIFI NEPRIPOJENA");
+      display.display();
+      delay(1500);
+    }
   }
 
   setupWebServer();
@@ -1087,7 +1257,7 @@ void loop() {
   updateTemperature();
 
   if (!apMode && WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastWifiRetryMs > 10000) {
+    if (millis() - lastWifiRetryMs > 15000) {
       lastWifiRetryMs = millis();
       WiFi.reconnect();
     }
