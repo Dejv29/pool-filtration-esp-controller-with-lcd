@@ -1123,6 +1123,11 @@ void handleSaveWiFi() {
   String ssid = server.arg("ssid");
   String pass = server.arg("pass");
   saveWifiCredentials(ssid, pass);
+
+  // Po uložení nových údajů chceme, aby se ESP pokusilo o připojení v režimu Klient.
+  prefForceAp = false;
+  saveWifiMode();
+
   server.send(200, "text/plain", "Saved. Restarting...");
   delay(800);
   ESP.restart();
