@@ -11,56 +11,38 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-// -----------------------------
 // Hardware pin mapping (ESP32-C3 SuperMini HW-466AB)
-// -----------------------------
 static const int PIN_OLED_SCK = 4;
 static const int PIN_OLED_SDA = 6;   // MOSI
 static const int PIN_OLED_CS = 7;
 static const int PIN_OLED_DC = 8;
 static const int PIN_OLED_RES = 9;
 
-static const int PIN_RELAY = 21;     // Relay transistor (BC337) base resistor -> this GPIO
+static const int PIN_RELAY = 21;     // Relay transistor (BC337) base resistor
 static const int PIN_ONEWIRE = 10;   // DS18B20 data pin
-// ADC vstup pro žebřík tlačítek.
-// Na ESP32-C3 má GPIO3 ADC1_CH3 a HW pull-up/pull-down (narozdíl od „jen vstupních“ pinů
-// GPIO34–39 u klasického ESP32). Slabý interní pull-up (~45 kΩ) často nestačí na klidný
-// analogový uzel — spolehlivější je odpor 10k–47k z ADC uzlu na 3V3 (+ volitelně 100nF na GND).
-// Jádro někdy po analogRead() stáhne pull-up; před čtením ho proto znovu zapínáme.
+
+// Na ESP32-C3 má GPIO3 ADC1_CH3 a HW pull-up/pull-down.
 static const int PIN_BUTTONS_ADC = 3; // 4 buttons over resistor ladder to GND
 static const int ADC_BUTTON_SAMPLES = 16; // průměr proti šumu ADC
 
 // Kalibrace tlačítek: na Serial každých 500 ms vypíše surovou hodnotu ADC (0..4095).
-// Po doladění prahů nastav na 0 a znovu nahraj firmware.
 #ifndef PRINT_ADC_CALIBRATION
 #define PRINT_ADC_CALIBRATION 0
 #endif
 static const unsigned long ADC_CALIB_PRINT_MS = 500;
 static unsigned long lastAdcCalibPrintMs = 0;
 
-// -----------------------------
-// OLED setup
-// -----------------------------
 static const int SCREEN_WIDTH = 128;
 static const int SCREEN_HEIGHT = 64;
-// SH1106 128x64 přes hardware SPI (stejné pořadí pinů jako u Adafruit_SSD1306)
+// SH1106 128x64 přes hardware SPI
 Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, PIN_OLED_DC, PIN_OLED_RES, PIN_OLED_CS);
 
-// -----------------------------
-// Temperature sensor
-// -----------------------------
 OneWire oneWire(PIN_ONEWIRE);
 DallasTemperature ds18b20(&oneWire);
 
-// -----------------------------
-// Web + config storage
-// -----------------------------
 WebServer server(80);
 Preferences prefs;
 
-// -----------------------------
-// Runtime settings/state
-// -----------------------------
 String wifiSsid;
 String wifiPass;
 bool apMode = false;
@@ -85,16 +67,10 @@ unsigned long lastNtpSyncMs = 0;
 unsigned long lastWifiRetryMs = 0;
 unsigned long lastUserActivityMs = 0;
 
-// -----------------------------
-// Time config
-// -----------------------------
 // Pro CZ použij "CET-1CEST,M3.5.0/2,M10.5.0/3"
 static const char *TZ_INFO = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 static const unsigned long NTP_SYNC_INTERVAL_MS = 60UL * 60UL * 1000UL; // 1h
 
-// -----------------------------
-// Button handling (ADC ladder)
-// -----------------------------
 enum ButtonId {
   BTN_NONE = 0,
   BTN_1 = 1,
@@ -115,7 +91,6 @@ static const unsigned long BUTTON_DEBOUNCE_MS = 40;
 static const unsigned long BUTTON_LONG_PRESS_MS = 1000;
 
 // ADC thresholds (12-bit ADC, 0..4095).
-// Dle reálných odporů je potřeba případně doladit.
 static const int ADC_BTN1_MAX = 400;
 static const int ADC_BTN2_MIN = 1100;
 static const int ADC_BTN2_MAX = 1300;
@@ -124,10 +99,6 @@ static const int ADC_BTN3_MAX = 1950;
 static const int ADC_BTN4_MIN = 2000;
 static const int ADC_BTN4_MAX = 2300;
 
-// -----------------------------
-// Softkeys (31x13)
-// Uprav si obsah bitmap dle potřeby.
-// -----------------------------
 static const int SOFTKEY_W = 31;
 static const int SOFTKEY_H = 13;
 static const int SOFTKEY_Y = 51;
@@ -179,10 +150,6 @@ const uint8_t bitmap_ok[SOFTKEY_BITMAP_SIZE] PROGMEM = {0x00, 0x00, 0x00, 0x00, 
 	0x03, 0x0c, 0xdc, 0x00, 0x03, 0x9c, 0xce, 0x00, 0x01, 0xf8, 0xc7, 0x00, 0x00, 0xf0, 0xc3, 0x00, 
 	0x00, 0x00, 0x00};
 
-// -----------------------------
-// WiFi icon (11x11)
-// Bitmapy si doplníš sám.
-// -----------------------------
 static const int WIFI_ICON_W = 11;
 static const int WIFI_ICON_H = 11;
 static const int WIFI_ICON_BYTES = ((WIFI_ICON_W + 7) / 8) * WIFI_ICON_H;
@@ -192,11 +159,6 @@ const uint8_t bitmap_wifiConnected[WIFI_ICON_BYTES] PROGMEM = {0x07, 0x00, 0x18,
 const uint8_t bitmap_wifiAp[WIFI_ICON_BYTES] PROGMEM = {0x73, 0xe0, 0x8a, 0x20, 0x8a, 0x20, 0x8a, 0x20, 0x8a, 0x20, 0xfb, 0xe0, 0x8a, 0x00, 0x8a, 0x00, 
 	0x8a, 0x00, 0x8a, 0x00, 0x8a, 0x00};        // Režim AP
 
-// -----------------------------
-// Velký font teploty (nahraď obsah PROGMEM polí vlastními bitmapami)
-// Číslice 24x64, °C 39x64, čárka 5x10, mínus 18x4
-// Počet bajtů = (šířka × výška + 7) / 8 — Image2cpp nesmí přidat řádky navíc (jinak „too many initializers“).
-// -----------------------------
 static const int TEMP_DIGIT_W = 24;
 static const int TEMP_DIGIT_H = 64;
 static const int TEMP_DIGIT_BYTES = (TEMP_DIGIT_W * TEMP_DIGIT_H + 7) / 8;
@@ -363,9 +325,6 @@ static const uint8_t *const epd_bitmap_digits[10] = {
     epd_bitmap_num_0, epd_bitmap_num_1, epd_bitmap_num_2, epd_bitmap_num_3, epd_bitmap_num_4,
     epd_bitmap_num_5, epd_bitmap_num_6, epd_bitmap_num_7, epd_bitmap_num_8, epd_bitmap_num_9};
 
-// -----------------------------
-// UI state
-// -----------------------------
 enum UiScreen {
   SCREEN_HOME = 0,
   SCREEN_TIMER,
@@ -389,9 +348,6 @@ int fullscreenTimeoutIdx = 1; // default 15s (index 1)
 static const int FULLSCREEN_TIMEOUTS[] = {0, 15000, 30000, 45000, 60000};
 static const char* FULLSCREEN_TIMEOUT_LABELS[] = {"OFF", "15s", "30s", "45s", "60s"};
 
-// -----------------------------
-// Utility
-// -----------------------------
 String twoDigits(int v) {
   if (v < 10) return "0" + String(v);
   return String(v);
@@ -419,7 +375,7 @@ bool isNowInSchedule(int nowMinutes) {
   return (nowMinutes >= onMin || nowMinutes < offMin);
 }
 
-/** V auto režimu: zda by časovač právě chtěl relé zapnuté (potřeba platného času z RTC/NTP). */
+/** V auto režimu: zda by časovač právě chtěl relé zapnuté. */
 bool scheduleWouldBeOnNow() {
   struct tm t;
   if (!getLocalTime(&t, 10)) return false;
@@ -434,7 +390,6 @@ void setRelay(bool on) {
 void applyRelayLogic() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo, 20)) {
-    // Když není čas dostupný, nech aktuální stav.
     if (manualOverride) setRelay(manualRelayState);
     return;
   }
@@ -443,11 +398,9 @@ void applyRelayLogic() {
   bool scheduleNow = isNowInSchedule(nowMinutes);
 
   if (manualOverride) {
-    // Pokud jsi manuálně vypnul relé během naplánovaného zapnutí,
-    // tak po přechodu časovače do OFF automaticky zrušíme MAN režim.
+    // Po přechodu časovače do OFF automaticky zrušíme MAN režim, pokud bylo relé vypnuto ručně během ON periody.
     if (!manualRelayState && prevScheduleNow && !scheduleNow) {
       manualOverride = false;
-      // pokračujeme dál: relé nastavíme dle auto režimu (bude OFF)
     } else {
       setRelay(manualRelayState);
       prevScheduleNow = scheduleNow;
@@ -514,7 +467,6 @@ void startApMode() {
   delay(200);
 
   WiFi.mode(WIFI_AP);
-  // Otevřená AP síť bez hesla (web pro konfiguraci).
   WiFi.softAP("PoolControlSetup");
 }
 
@@ -541,9 +493,6 @@ void syncTimeNow() {
   }
 }
 
-// -----------------------------
-// Buttons
-// -----------------------------
 static void adcButtonsEnsurePullUp() {
   pinMode(PIN_BUTTONS_ADC, INPUT_PULLUP);
   gpio_pullup_en((gpio_num_t)PIN_BUTTONS_ADC);
@@ -577,23 +526,19 @@ void updateButtons() {
   if (nowRaw != btn.rawBtn) {
     btn.rawBtn = nowRaw;
     btn.changedMs = nowMs;
-    // btn.longPressHandled = false; // Toto se nesmí mazat při každé změně raw, ale až při uvolnění!
   }
 
   if ((nowMs - btn.changedMs) < BUTTON_DEBOUNCE_MS) return;
 
   if (btn.stableBtn != btn.rawBtn) {
-    // state changed after debounce
     if (btn.stableBtn != BTN_NONE && btn.rawBtn == BTN_NONE) {
-      // released
       if (!btn.longPressHandled) {
         processShortPress(btn.stableBtn);
       }
-      btn.longPressHandled = false; // reset flag po uvolnění
+      btn.longPressHandled = false;
     }
     btn.stableBtn = btn.rawBtn;
   } else if (btn.stableBtn != BTN_NONE && !btn.longPressHandled) {
-    // still held
     if ((nowMs - btn.changedMs) >= BUTTON_LONG_PRESS_MS) {
       btn.longPressHandled = true;
       processLongPress(btn.stableBtn);
@@ -601,9 +546,6 @@ void updateButtons() {
   }
 }
 
-// -----------------------------
-// UI / Softkeys
-// -----------------------------
 void drawSoftkeys(const uint8_t *k1, const uint8_t *k2, const uint8_t *k3, const uint8_t *k4) {
   const uint8_t *keys[4] = {k1, k2, k3, k4};
   display.drawFastHLine(0, SOFTKEY_Y - 1, SCREEN_WIDTH, SH110X_WHITE);
@@ -1053,9 +995,6 @@ void updateDisplay() {
   }
 }
 
-// -----------------------------
-// Web server
-// -----------------------------
 String htmlPage() {
   String ipInfo = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   String modeInfo = apMode ? "AP" : "STA";
@@ -1207,13 +1146,11 @@ void setup() {
   delay(200);
 
   loadSettings();
-
   ds18b20.begin();
 
   // Na ESP32-C3 je potřeba navázat SPI na konkrétní piny (SCK, MISO=-1, MOSI).
   SPI.begin(PIN_OLED_SCK, -1, PIN_OLED_SDA);
 
-  // U SPI je první argument begin() ignorován; druhý = hard reset přes RES.
   if (!display.begin(0x3C, true)) {
     // Pokud OLED nenaběhne, pokračuj bez něj.
   } else {
