@@ -3,6 +3,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <time.h>
+#include <sys/time.h>
 #include <stdio.h>
 #include <string.h>
 #include <SPI.h>
@@ -12,14 +13,15 @@
 #include <DallasTemperature.h>
 
 // Hardware pin mapping (ESP32-C3 SuperMini HW-466AB)
-static const int PIN_OLED_SCK = 4;
-static const int PIN_OLED_SDA = 6;   // MOSI
-static const int PIN_OLED_CS = 7;
-static const int PIN_OLED_DC = 8;
-static const int PIN_OLED_RES = 9;
+static const int PIN_OLED_SCK = 21;
+static const int PIN_OLED_SDA = 20;   // MOSI
+static const int PIN_OLED_CS = 8;
+static const int PIN_OLED_DC = 9;
+static const int PIN_OLED_RES = 10;
 
-static const int PIN_RELAY = 21;     // Relay transistor (BC337) base resistor
-static const int PIN_ONEWIRE = 10;   // DS18B20 data pin
+static const int PIN_RELAY = 7;     // Relay transistor (BC337) base resistor
+static const int PIN_ONEWIRE = 4;   // DS18B20 data pin
+static const int PIN_SAFETY_SWITCH = 1;
 
 // Na ESP32-C3 má GPIO3 ADC1_CH3 a HW pull-up/pull-down.
 static const int PIN_BUTTONS_ADC = 3; // 4 buttons over resistor ladder to GND
@@ -61,11 +63,41 @@ bool manualRelayState = false;
 bool prevScheduleNow = false; // detekce přechodu plánovače ON->OFF
 
 float waterTempC = NAN;
+float pumpTempC = NAN;
+DeviceAddress tempAddr0 = {0};
+DeviceAddress tempAddr1 = {0};
+bool hasTempAddr0 = false;
+bool hasTempAddr1 = false;
+bool tempSensorsSwap = false;
 unsigned long lastTempReadMs = 0;
 unsigned long lastDisplayMs = 0;
 unsigned long lastNtpSyncMs = 0;
 unsigned long lastWifiRetryMs = 0;
 unsigned long lastUserActivityMs = 0;
+bool prevWifiConnected = false;
+
+static const unsigned long FLOOD_MANUAL_GRACE_MS = 60000;
+int floodProtectTimeoutIdx = 2;
+static const unsigned long FLOOD_PROTECT_TIMEOUTS_MS[] = {5000, 10000, 15000, 30000, 0};
+static const char* FLOOD_PROTECT_TIMEOUT_LABELS[] = {"5s", "10s", "15s", "30s", "OFF"};
+
+int tempProtectLimitIdx = 4;
+static const int TEMP_PROTECT_LIMITS_C[] = {40, 50, 60, 70, 80, 90, 100, 0};
+static const char* TEMP_PROTECT_LIMIT_LABELS[] = {"40 C", "50 C", "60 C", "70 C", "80 C", "90 C", "100 C", "OFF"};
+
+enum FaultType {
+  FAULT_NONE = 0,
+  FAULT_NOT_FLOODED,
+  FAULT_OVERHEAT
+};
+
+FaultType lockoutFault = FAULT_NONE;
+FaultType errorScreenFault = FAULT_NONE;
+
+unsigned long notFloodedSinceMs = 0;
+bool manualRecoveryActive = false;
+FaultType manualRecoveryReason = FAULT_NONE;
+unsigned long manualRecoveryStartMs = 0;
 
 // Pro CZ použij "CET-1CEST,M3.5.0/2,M10.5.0/3"
 static const char *TZ_INFO = "CET-1CEST,M3.5.0/2,M10.5.0/3";
@@ -91,13 +123,13 @@ static const unsigned long BUTTON_DEBOUNCE_MS = 40;
 static const unsigned long BUTTON_LONG_PRESS_MS = 1000;
 
 // ADC thresholds (12-bit ADC, 0..4095).
-static const int ADC_BTN1_MAX = 400;
-static const int ADC_BTN2_MIN = 1100;
-static const int ADC_BTN2_MAX = 1300;
-static const int ADC_BTN3_MIN = 1700;
-static const int ADC_BTN3_MAX = 1950;
-static const int ADC_BTN4_MIN = 2000;
-static const int ADC_BTN4_MAX = 2300;
+static const int ADC_BTN1_MAX = 450;
+static const int ADC_BTN2_MIN = 650;
+static const int ADC_BTN2_MAX = 750;
+static const int ADC_BTN3_MIN = 920;
+static const int ADC_BTN3_MAX = 1050;
+static const int ADC_BTN4_MIN = 1200;
+static const int ADC_BTN4_MAX = 1300;
 
 static const int SOFTKEY_W = 31;
 static const int SOFTKEY_H = 13;
@@ -330,7 +362,9 @@ enum UiScreen {
   SCREEN_TIMER,
   SCREEN_TEMP_FULL,
   SCREEN_SETTINGS,
-  SCREEN_INFO
+  SCREEN_TIME_SET,
+  SCREEN_INFO,
+  SCREEN_ERROR
 };
 
 enum TimerEditPart {
@@ -343,7 +377,12 @@ UiScreen uiScreen = SCREEN_HOME;
 int timerSelectedRow = 0; // 0=ON, 1=OFF, 2=Aktivni
 TimerEditPart timerEditPart = TIMER_EDIT_NONE;
 
-int settingsSelectedRow = 0; // 0=WifiMode, 1=FullscreenTemp
+int settingsSelectedRow = 0; // 0=WifiMode, 1=FullscreenTemp, 2=Hlidat zahlceni, 3=Tep. ochrana, 4=Informace, 5=Nastavit cas, 6=Prohodit cidla, 7=RESET CIDEL
+int timeSetHour = 12;
+int timeSetMinute = 0;
+TimerEditPart timeSetEditPart = TIMER_EDIT_NONE;
+UiScreen timeSetReturnScreen = SCREEN_SETTINGS;
+bool timeSetAfterSaveShowTimer = false;
 int fullscreenTimeoutIdx = 1; // default 15s (index 1)
 static const int FULLSCREEN_TIMEOUTS[] = {0, 15000, 30000, 45000, 60000};
 static const char* FULLSCREEN_TIMEOUT_LABELS[] = {"OFF", "15s", "30s", "45s", "60s"};
@@ -391,6 +430,7 @@ void applyRelayLogic() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo, 20)) {
     if (manualOverride) setRelay(manualRelayState);
+    else if (lockoutFault != FAULT_NONE) setRelay(false);
     return;
   }
 
@@ -408,6 +448,12 @@ void applyRelayLogic() {
     }
   }
 
+  if (lockoutFault != FAULT_NONE) {
+    setRelay(false);
+    prevScheduleNow = scheduleNow;
+    return;
+  }
+
   setRelay(scheduleNow);
   prevScheduleNow = scheduleNow;
 }
@@ -421,6 +467,19 @@ void loadSettings() {
   timerEnabled = prefs.getBool("timerEn", true);
   prefForceAp = prefs.getBool("forceAp", false);
   fullscreenTimeoutIdx = prefs.getInt("fsTmo", 1);
+  floodProtectTimeoutIdx = prefs.getInt("floodTmo", 2);
+  tempProtectLimitIdx = prefs.getInt("tempLim", 4);
+  tempSensorsSwap = prefs.getBool("tSwap", false);
+  hasTempAddr0 = false;
+  hasTempAddr1 = false;
+  if (prefs.getBytesLength("t0") == 8) {
+    prefs.getBytes("t0", tempAddr0, 8);
+    hasTempAddr0 = true;
+  }
+  if (prefs.getBytesLength("t1") == 8) {
+    prefs.getBytes("t1", tempAddr1, 8);
+    hasTempAddr1 = true;
+  }
   wifiSsid = prefs.getString("ssid", "");
   wifiPass = prefs.getString("pass", "");
   prefs.end();
@@ -430,6 +489,8 @@ void loadSettings() {
   schedOnMinute = constrain(schedOnMinute, 0, 59);
   schedOffMinute = constrain(schedOffMinute, 0, 59);
   fullscreenTimeoutIdx = constrain(fullscreenTimeoutIdx, 0, 4);
+  floodProtectTimeoutIdx = constrain(floodProtectTimeoutIdx, 0, 4);
+  tempProtectLimitIdx = constrain(tempProtectLimitIdx, 0, 7);
 }
 
 void saveSchedule() {
@@ -452,6 +513,65 @@ void saveFullscreenSettings() {
   prefs.begin("poolctl", false);
   prefs.putInt("fsTmo", fullscreenTimeoutIdx);
   prefs.end();
+}
+
+void saveProtectionSettings() {
+  prefs.begin("poolctl", false);
+  prefs.putInt("floodTmo", floodProtectTimeoutIdx);
+  prefs.putInt("tempLim", tempProtectLimitIdx);
+  prefs.end();
+}
+
+void saveTempSensorSwap() {
+  prefs.begin("poolctl", false);
+  prefs.putBool("tSwap", tempSensorsSwap);
+  prefs.end();
+}
+
+void clearTempSensorAddresses() {
+  prefs.begin("poolctl", false);
+  prefs.remove("t0");
+  prefs.remove("t1");
+  prefs.putBool("tSwap", false);
+  prefs.end();
+  hasTempAddr0 = false;
+  hasTempAddr1 = false;
+  tempSensorsSwap = false;
+}
+
+void saveTempSensorAddresses() {
+  prefs.begin("poolctl", false);
+  prefs.putBytes("t0", tempAddr0, 8);
+  prefs.putBytes("t1", tempAddr1, 8);
+  prefs.end();
+  hasTempAddr0 = true;
+  hasTempAddr1 = true;
+}
+
+void pairTempSensorsIfNeeded() {
+  if (hasTempAddr0 && hasTempAddr1) return;
+  int count = ds18b20.getDeviceCount();
+  if (count < 2) return;
+
+  DeviceAddress a = {0};
+  bool got0 = false;
+  bool got1 = false;
+
+  for (int i = 0; i < count; i++) {
+    if (!ds18b20.getAddress(a, i)) continue;
+    if (!got0) {
+      memcpy(tempAddr0, a, 8);
+      got0 = true;
+    } else if (!got1) {
+      memcpy(tempAddr1, a, 8);
+      got1 = true;
+      break;
+    }
+  }
+
+  if (got0 && got1) {
+    saveTempSensorAddresses();
+  }
 }
 
 void saveWifiCredentials(const String &ssid, const String &pass) {
@@ -490,6 +610,113 @@ void syncTimeNow() {
   struct tm t;
   if (getLocalTime(&t, 4000)) {
     lastNtpSyncMs = millis();
+  }
+}
+
+static void setSystemTimeFromLocalHm(int h, int m) {
+  setenv("TZ", TZ_INFO, 1);
+  tzset();
+
+  struct tm t;
+  if (!getLocalTime(&t, 10)) {
+    memset(&t, 0, sizeof(t));
+    t.tm_year = 2024 - 1900;
+    t.tm_mon = 0;
+    t.tm_mday = 1;
+  }
+
+  t.tm_hour = h;
+  t.tm_min = m;
+  t.tm_sec = 0;
+  t.tm_isdst = -1;
+
+  time_t epoch = mktime(&t);
+  if (epoch < 0) return;
+
+  timeval tv;
+  tv.tv_sec = epoch;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+  lastNtpSyncMs = millis();
+}
+
+static bool hasValidSystemTime() {
+  struct tm t;
+  if (!getLocalTime(&t, 10)) return false;
+  return t.tm_year >= (2023 - 1900);
+}
+
+static bool isFlooded() {
+  return digitalRead(PIN_SAFETY_SWITCH) == LOW;
+}
+
+static unsigned long floodProtectionTimeoutMs() {
+  return FLOOD_PROTECT_TIMEOUTS_MS[floodProtectTimeoutIdx];
+}
+
+static int tempProtectionLimitC() {
+  return TEMP_PROTECT_LIMITS_C[tempProtectLimitIdx];
+}
+
+static void triggerFault(FaultType fault) {
+  setRelay(false);
+  manualOverride = false;
+  manualRelayState = false;
+  manualRecoveryActive = false;
+  notFloodedSinceMs = 0;
+  lockoutFault = fault;
+  errorScreenFault = fault;
+  uiScreen = SCREEN_ERROR;
+}
+
+void updateProtections() {
+  unsigned long now = millis();
+  bool floodedNow = isFlooded();
+  unsigned long floodTmoMs = floodProtectionTimeoutMs();
+  int tempLimitC = tempProtectionLimitC();
+
+  if (manualRecoveryActive) {
+    if (manualRecoveryReason == FAULT_NOT_FLOODED) {
+      if (floodedNow) {
+        manualRecoveryActive = false;
+        lockoutFault = FAULT_NONE;
+        notFloodedSinceMs = 0;
+      } else if (now - manualRecoveryStartMs >= FLOOD_MANUAL_GRACE_MS) {
+        triggerFault(FAULT_NOT_FLOODED);
+      }
+      return;
+    }
+    if (manualRecoveryReason == FAULT_OVERHEAT) {
+      if (tempLimitC > 0 && !isnan(pumpTempC) && pumpTempC >= (float)tempLimitC) {
+        triggerFault(FAULT_OVERHEAT);
+        return;
+      }
+      manualRecoveryActive = false;
+      lockoutFault = FAULT_NONE;
+    }
+  }
+
+  if (relayState) {
+    if (floodTmoMs > 0) {
+      if (!floodedNow) {
+        if (notFloodedSinceMs == 0) notFloodedSinceMs = now;
+        if (now - notFloodedSinceMs >= floodTmoMs) {
+          triggerFault(FAULT_NOT_FLOODED);
+          return;
+        }
+      } else {
+        notFloodedSinceMs = 0;
+      }
+    } else {
+      notFloodedSinceMs = 0;
+    }
+
+    if (tempLimitC > 0 && !isnan(pumpTempC) && pumpTempC >= (float)tempLimitC) {
+      triggerFault(FAULT_OVERHEAT);
+      return;
+    }
+  } else {
+    notFloodedSinceMs = 0;
   }
 }
 
@@ -626,9 +853,61 @@ void processLongPress(ButtonId b) {
 void processShortPress(ButtonId b) {
   noteUserActivity();
 
+  if (uiScreen == SCREEN_ERROR) {
+    if (b == BTN_4) {
+      errorScreenFault = FAULT_NONE;
+      uiScreen = SCREEN_HOME;
+    }
+    return;
+  }
+
   if (uiScreen == SCREEN_TEMP_FULL) {
     uiScreen = SCREEN_HOME;
     return;
+  }
+
+  if (uiScreen == SCREEN_TIME_SET) {
+    if (timeSetEditPart == TIMER_EDIT_NONE) {
+      if (b == BTN_1) {
+        uiScreen = timeSetReturnScreen;
+        return;
+      }
+      if (b == BTN_4) {
+        timeSetEditPart = TIMER_EDIT_HOUR;
+        return;
+      }
+      return;
+    }
+
+    if (b == BTN_1) {
+      timeSetEditPart = TIMER_EDIT_NONE;
+      return;
+    }
+
+    if (timeSetEditPart == TIMER_EDIT_HOUR) {
+      if (b == BTN_2) timeSetHour = (timeSetHour + 23) % 24;
+      if (b == BTN_3) timeSetHour = (timeSetHour + 1) % 24;
+      if (b == BTN_4) timeSetEditPart = TIMER_EDIT_MINUTE;
+      return;
+    }
+
+    if (timeSetEditPart == TIMER_EDIT_MINUTE) {
+      if (b == BTN_2) timeSetMinute = (timeSetMinute + 59) % 60;
+      if (b == BTN_3) timeSetMinute = (timeSetMinute + 1) % 60;
+      if (b == BTN_4) {
+        timeSetEditPart = TIMER_EDIT_NONE;
+        setSystemTimeFromLocalHm(timeSetHour, timeSetMinute);
+        if (timeSetAfterSaveShowTimer) {
+          timeSetAfterSaveShowTimer = false;
+          uiScreen = SCREEN_TIMER;
+          timerSelectedRow = 0;
+          timerEditPart = TIMER_EDIT_NONE;
+        } else {
+          uiScreen = SCREEN_SETTINGS;
+        }
+      }
+      return;
+    }
   }
 
   if (uiScreen == SCREEN_SETTINGS) {
@@ -643,9 +922,9 @@ void processShortPress(ButtonId b) {
       }
       uiScreen = SCREEN_HOME;
     } else if (b == BTN_2) {
-      uiScreen = SCREEN_INFO;
+      settingsSelectedRow = (settingsSelectedRow + 7) % 8;
     } else if (b == BTN_3) {
-      settingsSelectedRow = (settingsSelectedRow + 1) % 2;
+      settingsSelectedRow = (settingsSelectedRow + 1) % 8;
     } else if (b == BTN_4) {
       if (settingsSelectedRow == 0) {
         prefForceAp = !prefForceAp;
@@ -654,6 +933,38 @@ void processShortPress(ButtonId b) {
       } else if (settingsSelectedRow == 1) {
         fullscreenTimeoutIdx = (fullscreenTimeoutIdx + 1) % 5;
         saveFullscreenSettings();
+      } else if (settingsSelectedRow == 2) {
+        floodProtectTimeoutIdx = (floodProtectTimeoutIdx + 1) % 5;
+        saveProtectionSettings();
+      } else if (settingsSelectedRow == 3) {
+        tempProtectLimitIdx = (tempProtectLimitIdx + 1) % 8;
+        saveProtectionSettings();
+      } else if (settingsSelectedRow == 4) {
+        uiScreen = SCREEN_INFO;
+      } else if (settingsSelectedRow == 5) {
+        struct tm t;
+        if (getLocalTime(&t, 10)) {
+          timeSetHour = t.tm_hour;
+          timeSetMinute = t.tm_min;
+        } else {
+          timeSetHour = 12;
+          timeSetMinute = 0;
+        }
+        timeSetEditPart = TIMER_EDIT_NONE;
+        timeSetReturnScreen = SCREEN_SETTINGS;
+        timeSetAfterSaveShowTimer = false;
+        uiScreen = SCREEN_TIME_SET;
+      } else if (settingsSelectedRow == 6) {
+        tempSensorsSwap = !tempSensorsSwap;
+        saveTempSensorSwap();
+      } else if (settingsSelectedRow == 7) {
+        clearTempSensorAddresses();
+        display.clearDisplay();
+        display.setCursor(20, 28);
+        display.print("Reset cidel...");
+        display.display();
+        delay(800);
+        ESP.restart();
       }
     }
     return;
@@ -661,15 +972,7 @@ void processShortPress(ButtonId b) {
 
   if (uiScreen == SCREEN_INFO) {
     if (b == BTN_1) {
-      if (wifiModeChanged) {
-        display.clearDisplay();
-        display.setCursor(0, 20);
-        display.print("Restartuji...");
-        display.display();
-        delay(1000);
-        ESP.restart();
-      }
-      uiScreen = SCREEN_HOME;
+      uiScreen = SCREEN_SETTINGS;
     } else if (b == BTN_2) {
       uiScreen = SCREEN_SETTINGS;
     } else if (b == BTN_3) {
@@ -684,7 +987,23 @@ void processShortPress(ButtonId b) {
       //        OFF stav -> filtrationOn = zapnout / ukončit manuál OFF
       if (manualOverride) {
         manualOverride = false;
+        manualRecoveryActive = false;
         applyRelayLogic();
+      } else if (lockoutFault != FAULT_NONE) {
+        if (lockoutFault == FAULT_OVERHEAT) {
+          int limitC = tempProtectionLimitC();
+          if (limitC > 0 && !isnan(pumpTempC) && pumpTempC >= (float)limitC) {
+            errorScreenFault = FAULT_OVERHEAT;
+            uiScreen = SCREEN_ERROR;
+            return;
+          }
+        }
+        manualOverride = true;
+        manualRelayState = true;
+        setRelay(true);
+        manualRecoveryActive = true;
+        manualRecoveryReason = lockoutFault;
+        manualRecoveryStartMs = millis();
       } else {
         if (scheduleWouldBeOnNow()) {
           manualOverride = true;
@@ -697,9 +1016,18 @@ void processShortPress(ButtonId b) {
         }
       }
     } else if (b == BTN_4) {
-      uiScreen = SCREEN_TIMER;
-      timerSelectedRow = 0;
-      timerEditPart = TIMER_EDIT_NONE;
+      if (!hasValidSystemTime()) {
+        timeSetHour = 12;
+        timeSetMinute = 0;
+        timeSetEditPart = TIMER_EDIT_NONE;
+        timeSetReturnScreen = SCREEN_HOME;
+        timeSetAfterSaveShowTimer = true;
+        uiScreen = SCREEN_TIME_SET;
+      } else {
+        uiScreen = SCREEN_TIMER;
+        timerSelectedRow = 0;
+        timerEditPart = TIMER_EDIT_NONE;
+      }
     }
     return;
   }
@@ -772,6 +1100,11 @@ void drawHomeScreen() {
     display.drawBitmap(SCREEN_WIDTH - WIFI_ICON_W, 0, wifiIcon, WIFI_ICON_W, WIFI_ICON_H, SH110X_WHITE);
   }
 
+  if (lockoutFault != FAULT_NONE) {
+    display.setCursor(0, 0);
+    display.print("!ERR!");
+  }
+
   display.setCursor(40, 0);
   if (hasTime) {
     display.print(twoDigits(timeinfo.tm_hour));
@@ -784,11 +1117,18 @@ void drawHomeScreen() {
   }
 
   display.setCursor(0, 10);
-  display.print("Voda: ");
+  display.print("Voda:");
   if (isnan(waterTempC)) {
     display.print("--.- C");
   } else {
     display.print(String(waterTempC, 1));
+    display.print(" C");
+  }
+  display.print("  Cer:");
+  if (isnan(pumpTempC)) {
+    display.print("-- C");
+  } else {
+    display.print((int)lroundf(pumpTempC));
     display.print(" C");
   }
 
@@ -807,7 +1147,7 @@ void drawHomeScreen() {
   display.print(timeHmString(schedOffHour, schedOffMinute));
 
   // Zobrazení odpovídá logickému „je zapnuto“: ON -> ikona vypnutí, OFF -> ikona zapnutí.
-  const bool logicalOn = manualOverride ? manualRelayState : scheduleWouldBeOnNow();
+  const bool logicalOn = manualOverride ? manualRelayState : (lockoutFault != FAULT_NONE ? false : scheduleWouldBeOnNow());
   const uint8_t *k1 = logicalOn ? bitmap_filtrationOff : bitmap_filtrationOn;
   drawSoftkeys(k1, nullptr, nullptr, bitmap_settings);
 
@@ -917,6 +1257,25 @@ void drawTimerScreen() {
   display.display();
 }
 
+void drawTimeSetScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  display.setCursor(18, 0);
+  display.print("-NASTAVIT CAS-");
+
+  drawLabeledTimeRow("CAS", 26, timeSetHour, timeSetMinute, true, timeSetEditPart == TIMER_EDIT_HOUR, timeSetEditPart == TIMER_EDIT_MINUTE);
+
+  if (timeSetEditPart == TIMER_EDIT_NONE) {
+    drawSoftkeys(bitmap_back, nullptr, nullptr, bitmap_ok);
+  } else {
+    drawSoftkeys(bitmap_back, bitmap_minus, bitmap_plus, bitmap_ok);
+  }
+
+  display.display();
+}
+
 void drawSettingsScreen() {
   display.clearDisplay();
   display.setTextSize(1);
@@ -925,31 +1284,52 @@ void drawSettingsScreen() {
   display.setCursor(6, 0);
   display.print("-NASTAVENI SYSTEMU-");
 
-  // Radek 0: Rezim WiFi
-  if (settingsSelectedRow == 0) {
-    display.fillRect(0, 14, SCREEN_WIDTH, 10, SH110X_WHITE);
-    display.setTextColor(SH110X_BLACK);
-  } else {
-    display.setTextColor(SH110X_WHITE);
-  }
-  display.setCursor(0, 15);
-  display.print("Rezim WiFi: ");
-  display.print(prefForceAp ? "AP" : "Klient");
+  const int totalRows = 8;
+  const int visibleRows = 4;
+  int firstRow = settingsSelectedRow - (visibleRows - 1);
+  if (firstRow < 0) firstRow = 0;
+  int maxFirstRow = totalRows - visibleRows;
+  if (firstRow > maxFirstRow) firstRow = maxFirstRow;
 
-  // Radek 1: Fullscreen temp
-  if (settingsSelectedRow == 1) {
-    display.fillRect(0, 24, SCREEN_WIDTH, 10, SH110X_WHITE);
-    display.setTextColor(SH110X_BLACK);
-  } else {
-    display.setTextColor(SH110X_WHITE);
+  for (int i = 0; i < visibleRows; i++) {
+    int row = firstRow + i;
+    int y = 12 + i * 10;
+
+    if (row == settingsSelectedRow) {
+      display.fillRect(0, y - 1, SCREEN_WIDTH, 10, SH110X_WHITE);
+      display.setTextColor(SH110X_BLACK);
+    } else {
+      display.setTextColor(SH110X_WHITE);
+    }
+
+    display.setCursor(0, y);
+    if (row == 0) {
+      display.print("Rezim WiFi: ");
+      display.print(prefForceAp ? "AP" : "Klient");
+    } else if (row == 1) {
+      display.print("Fullscreen temp: ");
+      display.print(FULLSCREEN_TIMEOUT_LABELS[fullscreenTimeoutIdx]);
+    } else if (row == 2) {
+      display.print("Hlidat zahlceni: ");
+      display.print(FLOOD_PROTECT_TIMEOUT_LABELS[floodProtectTimeoutIdx]);
+    } else if (row == 3) {
+      display.print("Tep. ochrana: ");
+      display.print(TEMP_PROTECT_LIMIT_LABELS[tempProtectLimitIdx]);
+    } else if (row == 4) {
+      display.print("Informace");
+    } else if (row == 5) {
+      display.print("Nastavit cas");
+    } else if (row == 6) {
+      display.print("Prohodit cidla: ");
+      display.print(tempSensorsSwap ? "ANO" : "NE");
+    } else if (row == 7) {
+      display.print("RESET CIDEL");
+    }
   }
-  display.setCursor(0, 25);
-  display.print("Fullscreen temp: ");
-  display.print(FULLSCREEN_TIMEOUT_LABELS[fullscreenTimeoutIdx]);
 
   display.setTextColor(SH110X_WHITE);
 
-  drawSoftkeys(bitmap_back, bitmap_arrowRight, bitmap_arrowDown, bitmap_ok);
+  drawSoftkeys(bitmap_back, bitmap_arrowUp, bitmap_arrowDown, bitmap_ok);
   display.display();
 }
 
@@ -978,6 +1358,27 @@ void drawInfoScreen() {
   display.display();
 }
 
+void drawErrorScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  display.setCursor(42, 0);
+  display.print("-CHYBA-");
+
+  display.setCursor(0, 24);
+  if (errorScreenFault == FAULT_NOT_FLOODED) {
+    display.print("    CERPADLO NENI\n      ZAHLCENO");
+  } else if (errorScreenFault == FAULT_OVERHEAT) {
+    display.print("  PREHRATI CERPADLA");
+  } else {
+    display.print("Neznama chyba");
+  }
+
+  drawSoftkeys(nullptr, nullptr, nullptr, bitmap_ok);
+  display.display();
+}
+
 void updateDisplay() {
   if (millis() - lastDisplayMs < 250) return;
   lastDisplayMs = millis();
@@ -986,10 +1387,14 @@ void updateDisplay() {
     drawHomeScreen();
   } else if (uiScreen == SCREEN_TIMER) {
     drawTimerScreen();
+  } else if (uiScreen == SCREEN_TIME_SET) {
+    drawTimeSetScreen();
   } else if (uiScreen == SCREEN_SETTINGS) {
     drawSettingsScreen();
   } else if (uiScreen == SCREEN_INFO) {
     drawInfoScreen();
+  } else if (uiScreen == SCREEN_ERROR) {
+    drawErrorScreen();
   } else {
     drawWaterTempFullScreen();
   }
@@ -1000,14 +1405,16 @@ String htmlPage() {
   String modeInfo = apMode ? "AP" : "STA";
 
   String s;
-  s += "<!doctype html><html><head><meta charset='utf-8'><title>Pool Controller</title></head><body>";
+  s += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  s += "<title>Pool Controller</title></head><body>";
   s += "<h2>Pool Controller</h2>";
   s += "<p><b>Mode:</b> " + modeInfo + " | <b>IP:</b> " + ipInfo + "</p>";
-  s += "<p><b>Water temp:</b> " + String(isnan(waterTempC) ? -999.0f : waterTempC, 1) + " C</p>";
-  s += "<p><b>Relay:</b> " + String(relayState ? "ON" : "OFF") + "</p>";
-  s += "<p><b>Manual override:</b> " + String(manualOverride ? "ON" : "OFF") + "</p>";
-  s += "<p><b>Timer active:</b> " + String(timerEnabled ? "ON" : "OFF") + "</p>";
-  s += "<p><b>Schedule:</b> " + timeHmString(schedOnHour, schedOnMinute) + " - " + timeHmString(schedOffHour, schedOffMinute) + "</p>";
+  s += "<p><b>Time:</b> <span id='time'>--:--:--</span></p>";
+  s += "<p><b>Teploty:</b> Voda <span id='water_temp'>N/A</span> | Cerpadlo <span id='pump_temp'>N/A</span></p>";
+  s += "<p><b>Relay:</b> <span id='relay'>?</span> | <b>Manual override:</b> <span id='manual_override'>?</span></p>";
+  s += "<p><b>Timer:</b> <span id='timer_enabled'>?</span> | <b>Schedule:</b> <span id='schedule'>--:-- - --:--</span></p>";
+  s += "<p><b>Safety switch:</b> <span id='safety_ok'>?</span> | <b>Chyba:</b> <span id='fault'>zadna</span></p>";
+  s += "<p><b>Hlidat zahlceni:</b> <span id='flood_protect'>?</span> | <b>Tep. ochrana:</b> <span id='temp_protect'>?</span></p>";
   s += "<hr>";
   s += "<h3>WiFi config</h3>";
   s += "<form method='POST' action='/savewifi'>";
@@ -1027,6 +1434,29 @@ String htmlPage() {
   s += "<button type='submit'>Save schedule</button></form>";
   s += "<hr>";
   s += "<p><a href='/toggle'>Toggle relay (manual)</a> | <a href='/auto'>Back to auto</a> | <a href='/status'>JSON status</a></p>";
+  s += "<script>";
+  s += "function fmtTemp(v, dec){ if(v===null||v===undefined||v<-200) return 'N/A'; return v.toFixed(dec)+' C'; }";
+  s += "function txt(id, v){ var e=document.getElementById(id); if(e) e.textContent=v; }";
+  s += "async function refresh(){";
+  s += "try{";
+  s += "const r=await fetch('/status',{cache:'no-store'});";
+  s += "if(!r.ok) return;";
+  s += "const s=await r.json();";
+  s += "txt('time', s.time || '--:--:--');";
+  s += "txt('water_temp', fmtTemp(s.water_temp_c, 1));";
+  s += "txt('pump_temp', fmtTemp(s.pump_temp_c, 0));";
+  s += "txt('relay', s.relay ? 'ON' : 'OFF');";
+  s += "txt('manual_override', s.manual_override ? 'ON' : 'OFF');";
+  s += "txt('timer_enabled', s.timer_enabled ? 'ON' : 'OFF');";
+  s += "txt('schedule', (s.schedule_on||'--:--') + ' - ' + (s.schedule_off||'--:--'));";
+  s += "txt('safety_ok', (s.safety_ok===true) ? 'OK' : 'OPEN');";
+  s += "txt('fault', s.lockout_fault_label || 'zadna');";
+  s += "txt('flood_protect', s.flood_protect_label || '?');";
+  s += "txt('temp_protect', s.temp_protect_label || '?');";
+  s += "}catch(e){}";
+  s += "}";
+  s += "refresh(); setInterval(refresh, 1000);";
+  s += "</script>";
   s += "</body></html>";
   return s;
 }
@@ -1040,17 +1470,38 @@ void handleStatus() {
   bool hasTime = getLocalTime(&t, 10);
   String nowStr = hasTime ? (twoDigits(t.tm_hour) + ":" + twoDigits(t.tm_min) + ":" + twoDigits(t.tm_sec)) : "--:--:--";
 
+  String lockoutKey = "none";
+  String lockoutLabel = "zadna";
+  if (lockoutFault == FAULT_NOT_FLOODED) {
+    lockoutKey = "not_flooded";
+    lockoutLabel = "Cerpadlo neni zahlceno";
+  } else if (lockoutFault == FAULT_OVERHEAT) {
+    lockoutKey = "overheat";
+    lockoutLabel = "Prehrati cerpadla";
+  }
+
+  bool safetyOk = (digitalRead(PIN_SAFETY_SWITCH) == LOW);
+
   String json = "{";
   json += "\"mode\":\"" + String(apMode ? "AP" : "STA") + "\",";
   json += "\"ip\":\"" + String(apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "\",";
   json += "\"time\":\"" + nowStr + "\",";
+  json += "\"has_time\":" + String(hasTime ? "true" : "false") + ",";
   json += "\"temperature_c\":" + String(isnan(waterTempC) ? -999.0f : waterTempC, 2) + ",";
+  json += "\"water_temp_c\":" + String(isnan(waterTempC) ? "null" : String(waterTempC, 2)) + ",";
+  json += "\"pump_temp_c\":" + String(isnan(pumpTempC) ? "null" : String(pumpTempC, 2)) + ",";
   json += "\"relay\":" + String(relayState ? "true" : "false") + ",";
   json += "\"manual_override\":" + String(manualOverride ? "true" : "false") + ",";
   json += "\"timer_enabled\":" + String(timerEnabled ? "true" : "false") + ",";
   json += "\"schedule_on\":\"" + timeHmString(schedOnHour, schedOnMinute) + "\",";
-  json += "\"schedule_off\":\"" + timeHmString(schedOffHour, schedOffMinute) + "\"";
+  json += "\"schedule_off\":\"" + timeHmString(schedOffHour, schedOffMinute) + "\",";
+  json += "\"safety_ok\":" + String(safetyOk ? "true" : "false") + ",";
+  json += "\"lockout_fault\":\"" + lockoutKey + "\",";
+  json += "\"lockout_fault_label\":\"" + lockoutLabel + "\",";
+  json += "\"flood_protect_label\":\"" + String(FLOOD_PROTECT_TIMEOUT_LABELS[floodProtectTimeoutIdx]) + "\",";
+  json += "\"temp_protect_label\":\"" + String(TEMP_PROTECT_LIMIT_LABELS[tempProtectLimitIdx]) + "\"";
   json += "}";
+  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
 }
 
@@ -1087,9 +1538,30 @@ void handleSaveSchedule() {
 }
 
 void handleToggleRelay() {
-  manualOverride = true;
-  manualRelayState = !relayState;
-  setRelay(manualRelayState);
+  bool desiredOn = !relayState;
+  if (desiredOn && lockoutFault != FAULT_NONE) {
+    if (lockoutFault == FAULT_OVERHEAT) {
+      int limitC = tempProtectionLimitC();
+      if (limitC > 0 && !isnan(pumpTempC) && pumpTempC >= (float)limitC) {
+        errorScreenFault = FAULT_OVERHEAT;
+        uiScreen = SCREEN_ERROR;
+        desiredOn = false;
+      }
+    }
+    if (desiredOn) {
+      manualOverride = true;
+      manualRelayState = true;
+      setRelay(true);
+      manualRecoveryActive = true;
+      manualRecoveryReason = lockoutFault;
+      manualRecoveryStartMs = millis();
+    }
+  } else {
+    manualOverride = true;
+    manualRelayState = desiredOn;
+    setRelay(desiredOn);
+    if (!desiredOn) manualRecoveryActive = false;
+  }
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "Redirect");
 }
@@ -1128,15 +1600,23 @@ void updateTemperature() {
   if (millis() - lastTempReadMs < 5000) return;
   lastTempReadMs = millis();
   ds18b20.requestTemperatures();
-  float t = ds18b20.getTempCByIndex(0);
-  if (t > -55.0f && t < 125.0f) {
-    waterTempC = t;
-  }
+  float t0 = hasTempAddr0 ? ds18b20.getTempC(tempAddr0) : ds18b20.getTempCByIndex(0);
+  float t1 = hasTempAddr1 ? ds18b20.getTempC(tempAddr1) : ds18b20.getTempCByIndex(1);
+
+  float tw = tempSensorsSwap ? t1 : t0;
+  float tp = tempSensorsSwap ? t0 : t1;
+
+  if (tw > -55.0f && tw < 125.0f) waterTempC = tw;
+  else waterTempC = NAN;
+
+  if (tp > -55.0f && tp < 125.0f) pumpTempC = tp;
+  else pumpTempC = NAN;
 }
 
 void setup() {
   pinMode(PIN_RELAY, OUTPUT);
   setRelay(false);
+  pinMode(PIN_SAFETY_SWITCH, INPUT_PULLUP);
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
@@ -1146,7 +1626,10 @@ void setup() {
   delay(200);
 
   loadSettings();
+  setenv("TZ", TZ_INFO, 1);
+  tzset();
   ds18b20.begin();
+  pairTempSensorsIfNeeded();
 
   // Na ESP32-C3 je potřeba navázat SPI na konkrétní piny (SCK, MISO=-1, MOSI).
   SPI.begin(PIN_OLED_SCK, -1, PIN_OLED_SDA);
@@ -1190,6 +1673,7 @@ void setup() {
   WiFi.setSleep(false);
   applyRelayLogic();
   lastUserActivityMs = millis();
+  prevWifiConnected = (!apMode && WiFi.status() == WL_CONNECTED);
 }
 
 void loop() {
@@ -1206,12 +1690,17 @@ void loop() {
   }
 
   if (!apMode && WiFi.status() == WL_CONNECTED) {
+    if (!prevWifiConnected) {
+      syncTimeNow();
+    }
     if ((millis() - lastNtpSyncMs) > NTP_SYNC_INTERVAL_MS) {
       syncTimeNow();
     }
   }
+  prevWifiConnected = (!apMode && WiFi.status() == WL_CONNECTED);
 
   applyRelayLogic();
+  updateProtections();
   checkIdleToTempScreen();
   updateDisplay();
   delay(10);
