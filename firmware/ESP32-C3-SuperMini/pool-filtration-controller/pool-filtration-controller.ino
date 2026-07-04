@@ -1,6 +1,7 @@
 #include <WiFi.h>
 #include <driver/gpio.h>
 #include <WebServer.h>
+#include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <time.h>
 #include <sys/time.h>
@@ -21,7 +22,7 @@ static const int PIN_OLED_RES = 10;
 
 static const int PIN_RELAY = 7;     // Relay transistor (BC337) base resistor
 static const int PIN_ONEWIRE = 4;   // DS18B20 data pin
-static const int PIN_SAFETY_SWITCH = 1;
+static const int PIN_SAFETY_SWITCH = 0;
 
 // Na ESP32-C3 má GPIO3 ADC1_CH3 a HW pull-up/pull-down.
 static const int PIN_BUTTONS_ADC = 3; // 4 buttons over resistor ladder to GND
@@ -75,15 +76,29 @@ unsigned long lastNtpSyncMs = 0;
 unsigned long lastWifiRetryMs = 0;
 unsigned long lastUserActivityMs = 0;
 bool prevWifiConnected = false;
+bool otaInitialized = false;
 
 static const unsigned long FLOOD_MANUAL_GRACE_MS = 60000;
 int floodProtectTimeoutIdx = 2;
-static const unsigned long FLOOD_PROTECT_TIMEOUTS_MS[] = {5000, 10000, 15000, 30000, 0};
-static const char* FLOOD_PROTECT_TIMEOUT_LABELS[] = {"5s", "10s", "15s", "30s", "OFF"};
+static const unsigned long FLOOD_PROTECT_TIMEOUTS_MS[] = {5000, 10000, 15000, 30000, 45000, 60000, 0};
+static const char* FLOOD_PROTECT_TIMEOUT_LABELS[] = {"5s", "10s", "15s", "30s", "45s", "60s", "OFF"};
 
 int tempProtectLimitIdx = 4;
 static const int TEMP_PROTECT_LIMITS_C[] = {40, 50, 60, 70, 80, 90, 100, 0};
 static const char* TEMP_PROTECT_LIMIT_LABELS[] = {"40 C", "50 C", "60 C", "70 C", "80 C", "90 C", "100 C", "OFF"};
+
+int pressureLowThresholdDeciBar = 5;   // 0.5 bar
+int pressureHighThresholdDeciBar = 0;  // 0 = OFF
+int pressureCalPoint1DeciBar = 0;
+int pressureCalPoint1Adc = -1;
+int pressureCalPoint2DeciBar = 10;     // 1.0 bar
+int pressureCalPoint2Adc = -1;
+int pressureCalSelectedRow = 0;
+bool pressureCalEditingValue = false;
+
+int pressureRawAdc = 0;
+float pressureBar = NAN;
+unsigned long lastPressureReadMs = 0;
 
 enum FaultType {
   FAULT_NONE = 0,
@@ -363,6 +378,7 @@ enum UiScreen {
   SCREEN_TEMP_FULL,
   SCREEN_SETTINGS,
   SCREEN_TIME_SET,
+  SCREEN_PRESSURE_CAL,
   SCREEN_INFO,
   SCREEN_ERROR
 };
@@ -377,7 +393,8 @@ UiScreen uiScreen = SCREEN_HOME;
 int timerSelectedRow = 0; // 0=ON, 1=OFF, 2=Aktivni
 TimerEditPart timerEditPart = TIMER_EDIT_NONE;
 
-int settingsSelectedRow = 0; // 0=WifiMode, 1=FullscreenTemp, 2=Hlidat zahlceni, 3=Tep. ochrana, 4=Informace, 5=Nastavit cas, 6=Prohodit cidla, 7=RESET CIDEL
+int settingsSelectedRow = 0; // 0=WifiMode, 1=FullscreenTemp, 2=Hlidat zahlceni, 3=Min tlak, 4=Vysoky tlak, 5=Kalibrace tlaku, 6=Tep. ochrana, 7=Informace, 8=Nastavit cas, 9=Prohodit cidla, 10=RESET CIDEL
+int infoPageIdx = 0;
 int timeSetHour = 12;
 int timeSetMinute = 0;
 TimerEditPart timeSetEditPart = TIMER_EDIT_NONE;
@@ -469,6 +486,12 @@ void loadSettings() {
   fullscreenTimeoutIdx = prefs.getInt("fsTmo", 1);
   floodProtectTimeoutIdx = prefs.getInt("floodTmo", 2);
   tempProtectLimitIdx = prefs.getInt("tempLim", 4);
+  pressureLowThresholdDeciBar = prefs.getInt("pLo", 5);
+  pressureHighThresholdDeciBar = prefs.getInt("pHi", 0);
+  pressureCalPoint1DeciBar = prefs.getInt("pC1b", 0);
+  pressureCalPoint1Adc = prefs.getInt("pC1a", -1);
+  pressureCalPoint2DeciBar = prefs.getInt("pC2b", 10);
+  pressureCalPoint2Adc = prefs.getInt("pC2a", -1);
   tempSensorsSwap = prefs.getBool("tSwap", false);
   hasTempAddr0 = false;
   hasTempAddr1 = false;
@@ -489,8 +512,14 @@ void loadSettings() {
   schedOnMinute = constrain(schedOnMinute, 0, 59);
   schedOffMinute = constrain(schedOffMinute, 0, 59);
   fullscreenTimeoutIdx = constrain(fullscreenTimeoutIdx, 0, 4);
-  floodProtectTimeoutIdx = constrain(floodProtectTimeoutIdx, 0, 4);
+  floodProtectTimeoutIdx = constrain(floodProtectTimeoutIdx, 0, 6);
   tempProtectLimitIdx = constrain(tempProtectLimitIdx, 0, 7);
+  pressureLowThresholdDeciBar = constrain(pressureLowThresholdDeciBar, 0, 60);
+  pressureHighThresholdDeciBar = constrain(pressureHighThresholdDeciBar, 0, 60);
+  pressureCalPoint1DeciBar = constrain(pressureCalPoint1DeciBar, 0, 60);
+  pressureCalPoint2DeciBar = constrain(pressureCalPoint2DeciBar, 0, 60);
+  pressureCalPoint1Adc = constrain(pressureCalPoint1Adc, -1, 4095);
+  pressureCalPoint2Adc = constrain(pressureCalPoint2Adc, -1, 4095);
 }
 
 void saveSchedule() {
@@ -519,6 +548,17 @@ void saveProtectionSettings() {
   prefs.begin("poolctl", false);
   prefs.putInt("floodTmo", floodProtectTimeoutIdx);
   prefs.putInt("tempLim", tempProtectLimitIdx);
+  prefs.putInt("pLo", pressureLowThresholdDeciBar);
+  prefs.putInt("pHi", pressureHighThresholdDeciBar);
+  prefs.end();
+}
+
+void savePressureCalibration() {
+  prefs.begin("poolctl", false);
+  prefs.putInt("pC1b", pressureCalPoint1DeciBar);
+  prefs.putInt("pC1a", pressureCalPoint1Adc);
+  prefs.putInt("pC2b", pressureCalPoint2DeciBar);
+  prefs.putInt("pC2a", pressureCalPoint2Adc);
   prefs.end();
 }
 
@@ -646,8 +686,71 @@ static bool hasValidSystemTime() {
   return t.tm_year >= (2023 - 1900);
 }
 
-static bool isFlooded() {
-  return digitalRead(PIN_SAFETY_SWITCH) == LOW;
+static String deciBarToString(int deciBar) {
+  return String(deciBar / 10.0f, 1);
+}
+
+static void pressureSensorPrepareInput() {
+  pinMode(PIN_SAFETY_SWITCH, INPUT);
+  gpio_pullup_dis((gpio_num_t)PIN_SAFETY_SWITCH);
+  gpio_pulldown_dis((gpio_num_t)PIN_SAFETY_SWITCH);
+}
+
+static int readPressureAdcAveraged() {
+  pressureSensorPrepareInput();
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) {
+    sum += analogRead(PIN_SAFETY_SWITCH);
+  }
+  return (int)(sum / 8);
+}
+
+static bool pressureCalibrationValid() {
+  return pressureCalPoint1Adc >= 0 && pressureCalPoint2Adc >= 0 &&
+         pressureCalPoint1Adc != pressureCalPoint2Adc &&
+         pressureCalPoint1DeciBar != pressureCalPoint2DeciBar;
+}
+
+static float pressureLowThresholdBar() {
+  return pressureLowThresholdDeciBar / 10.0f;
+}
+
+static float pressureHighThresholdBar() {
+  return pressureHighThresholdDeciBar / 10.0f;
+}
+
+static float pressureFromAdc(int adc) {
+  if (!pressureCalibrationValid()) return NAN;
+
+  float adc1 = (float)pressureCalPoint1Adc;
+  float adc2 = (float)pressureCalPoint2Adc;
+  float bar1 = pressureCalPoint1DeciBar / 10.0f;
+  float bar2 = pressureCalPoint2DeciBar / 10.0f;
+  float slope = (bar2 - bar1) / (adc2 - adc1);
+  return bar1 + ((float)adc - adc1) * slope;
+}
+
+static bool hasAdequatePressure() {
+  if (!pressureCalibrationValid() || isnan(pressureBar)) return true;
+  if (pressureLowThresholdDeciBar <= 0) return true;
+  return pressureBar >= pressureLowThresholdBar();
+}
+
+static bool highPressureWarningActive() {
+  if (!pressureCalibrationValid() || isnan(pressureBar)) return false;
+  if (pressureHighThresholdDeciBar <= 0) return false;
+  return pressureBar >= pressureHighThresholdBar();
+}
+
+static bool showSandWarningTextNow() {
+  return highPressureWarningActive() && (((millis() / 2000UL) % 2UL) == 1UL);
+}
+
+void updatePressure() {
+  if (millis() - lastPressureReadMs < 500) return;
+  lastPressureReadMs = millis();
+  pressureRawAdc = readPressureAdcAveraged();
+  pressureBar = pressureFromAdc(pressureRawAdc);
 }
 
 static unsigned long floodProtectionTimeoutMs() {
@@ -671,13 +774,13 @@ static void triggerFault(FaultType fault) {
 
 void updateProtections() {
   unsigned long now = millis();
-  bool floodedNow = isFlooded();
+  bool adequatePressureNow = hasAdequatePressure();
   unsigned long floodTmoMs = floodProtectionTimeoutMs();
   int tempLimitC = tempProtectionLimitC();
 
   if (manualRecoveryActive) {
     if (manualRecoveryReason == FAULT_NOT_FLOODED) {
-      if (floodedNow) {
+      if (adequatePressureNow) {
         manualRecoveryActive = false;
         lockoutFault = FAULT_NONE;
         notFloodedSinceMs = 0;
@@ -697,8 +800,8 @@ void updateProtections() {
   }
 
   if (relayState) {
-    if (floodTmoMs > 0) {
-      if (!floodedNow) {
+    if (floodTmoMs > 0 && pressureCalibrationValid()) {
+      if (!adequatePressureNow) {
         if (notFloodedSinceMs == 0) notFloodedSinceMs = now;
         if (now - notFloodedSinceMs >= floodTmoMs) {
           triggerFault(FAULT_NOT_FLOODED);
@@ -910,6 +1013,48 @@ void processShortPress(ButtonId b) {
     }
   }
 
+  if (uiScreen == SCREEN_PRESSURE_CAL) {
+    if (!pressureCalEditingValue) {
+      if (b == BTN_1) {
+        uiScreen = SCREEN_SETTINGS;
+        return;
+      }
+      if (b == BTN_2) {
+        pressureCalSelectedRow = (pressureCalSelectedRow + 3) % 4;
+        return;
+      }
+      if (b == BTN_3) {
+        pressureCalSelectedRow = (pressureCalSelectedRow + 1) % 4;
+        return;
+      }
+      if (b == BTN_4) {
+        if (pressureCalSelectedRow == 0 || pressureCalSelectedRow == 2) {
+          pressureCalEditingValue = true;
+        } else if (pressureCalSelectedRow == 1) {
+          pressureCalPoint1Adc = pressureRawAdc;
+          savePressureCalibration();
+        } else if (pressureCalSelectedRow == 3) {
+          pressureCalPoint2Adc = pressureRawAdc;
+          savePressureCalibration();
+        }
+        return;
+      }
+    } else {
+      int *target = (pressureCalSelectedRow == 0) ? &pressureCalPoint1DeciBar : &pressureCalPoint2DeciBar;
+      if (b == BTN_1) {
+        pressureCalEditingValue = false;
+        return;
+      }
+      if (b == BTN_2) *target = constrain(*target - 1, 0, 60);
+      if (b == BTN_3) *target = constrain(*target + 1, 0, 60);
+      if (b == BTN_4) {
+        pressureCalEditingValue = false;
+        savePressureCalibration();
+      }
+      return;
+    }
+  }
+
   if (uiScreen == SCREEN_SETTINGS) {
     if (b == BTN_1) {
       if (wifiModeChanged) {
@@ -922,9 +1067,9 @@ void processShortPress(ButtonId b) {
       }
       uiScreen = SCREEN_HOME;
     } else if (b == BTN_2) {
-      settingsSelectedRow = (settingsSelectedRow + 7) % 8;
+      settingsSelectedRow = (settingsSelectedRow + 10) % 11;
     } else if (b == BTN_3) {
-      settingsSelectedRow = (settingsSelectedRow + 1) % 8;
+      settingsSelectedRow = (settingsSelectedRow + 1) % 11;
     } else if (b == BTN_4) {
       if (settingsSelectedRow == 0) {
         prefForceAp = !prefForceAp;
@@ -934,14 +1079,25 @@ void processShortPress(ButtonId b) {
         fullscreenTimeoutIdx = (fullscreenTimeoutIdx + 1) % 5;
         saveFullscreenSettings();
       } else if (settingsSelectedRow == 2) {
-        floodProtectTimeoutIdx = (floodProtectTimeoutIdx + 1) % 5;
+        floodProtectTimeoutIdx = (floodProtectTimeoutIdx + 1) % 7;
         saveProtectionSettings();
       } else if (settingsSelectedRow == 3) {
-        tempProtectLimitIdx = (tempProtectLimitIdx + 1) % 8;
+        pressureLowThresholdDeciBar = (pressureLowThresholdDeciBar + 1) % 31;
         saveProtectionSettings();
       } else if (settingsSelectedRow == 4) {
-        uiScreen = SCREEN_INFO;
+        pressureHighThresholdDeciBar = (pressureHighThresholdDeciBar + 1) % 31;
+        saveProtectionSettings();
       } else if (settingsSelectedRow == 5) {
+        pressureCalSelectedRow = 0;
+        pressureCalEditingValue = false;
+        uiScreen = SCREEN_PRESSURE_CAL;
+      } else if (settingsSelectedRow == 6) {
+        tempProtectLimitIdx = (tempProtectLimitIdx + 1) % 8;
+        saveProtectionSettings();
+      } else if (settingsSelectedRow == 7) {
+        infoPageIdx = 0;
+        uiScreen = SCREEN_INFO;
+      } else if (settingsSelectedRow == 8) {
         struct tm t;
         if (getLocalTime(&t, 10)) {
           timeSetHour = t.tm_hour;
@@ -954,10 +1110,10 @@ void processShortPress(ButtonId b) {
         timeSetReturnScreen = SCREEN_SETTINGS;
         timeSetAfterSaveShowTimer = false;
         uiScreen = SCREEN_TIME_SET;
-      } else if (settingsSelectedRow == 6) {
+      } else if (settingsSelectedRow == 9) {
         tempSensorsSwap = !tempSensorsSwap;
         saveTempSensorSwap();
-      } else if (settingsSelectedRow == 7) {
+      } else if (settingsSelectedRow == 10) {
         clearTempSensorAddresses();
         display.clearDisplay();
         display.setCursor(20, 28);
@@ -974,9 +1130,7 @@ void processShortPress(ButtonId b) {
     if (b == BTN_1) {
       uiScreen = SCREEN_SETTINGS;
     } else if (b == BTN_2) {
-      uiScreen = SCREEN_SETTINGS;
-    } else if (b == BTN_3) {
-      // arrowDown - placeholder
+      infoPageIdx = (infoPageIdx + 1) % 2;
     }
     return;
   }
@@ -1084,6 +1238,7 @@ void processShortPress(ButtonId b) {
 void drawHomeScreen() {
   struct tm timeinfo;
   bool hasTime = getLocalTime(&timeinfo, 10);
+  bool sandWarningText = showSandWarningTextNow();
 
   display.clearDisplay();
   display.setTextSize(1);
@@ -1138,13 +1293,24 @@ void drawHomeScreen() {
   if (manualOverride) display.print(" (MAN)");
 
   display.setCursor(0, 30);
-  display.print("Casovac: ");
-  display.print(timerEnabled ? "AKTIVNI" : "Vypnuty");
+  if (sandWarningText) {
+    display.print("ZANESENI PISKU");
+  } else {
+    display.print("Tlak: ");
+    if (pressureCalibrationValid() && !isnan(pressureBar)) {
+      display.print(String(pressureBar, 1));
+      display.print(" bar");
+    } else {
+      display.print("--.- bar");
+    }
+  }
 
-  display.setCursor(27, 40);
-  display.print(timeHmString(schedOnHour, schedOnMinute));
-  display.print(" - ");
-  display.print(timeHmString(schedOffHour, schedOffMinute));
+  if (timerEnabled) {
+    display.setCursor(27, 40);
+    display.print(timeHmString(schedOnHour, schedOnMinute));
+    display.print(" - ");
+    display.print(timeHmString(schedOffHour, schedOffMinute));
+  }
 
   // Zobrazení odpovídá logickému „je zapnuto“: ON -> ikona vypnutí, OFF -> ikona zapnutí.
   const bool logicalOn = manualOverride ? manualRelayState : (lockoutFault != FAULT_NONE ? false : scheduleWouldBeOnNow());
@@ -1156,6 +1322,16 @@ void drawHomeScreen() {
 
 void drawWaterTempFullScreen() {
   display.clearDisplay();
+  if (showSandWarningTextNow()) {
+    display.setTextSize(2);
+    display.setTextColor(SH110X_WHITE);
+    display.setCursor(4, 16);
+    display.print("ZANESENI");
+    display.setCursor(20, 36);
+    display.print("PISKU");
+    display.display();
+    return;
+  }
   if (isnan(waterTempC)) {
     display.setTextSize(2);
     display.setTextColor(SH110X_WHITE);
@@ -1276,6 +1452,64 @@ void drawTimeSetScreen() {
   display.display();
 }
 
+void drawPressureCalibrationScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  display.setCursor(8, 0);
+  display.print("-KALIBRACE TLAKU-");
+
+  for (int row = 0; row < 4; row++) {
+    int y = 14 + row * 10;
+    bool invertRow = (pressureCalSelectedRow == row) && !pressureCalEditingValue;
+    if (invertRow) {
+      display.fillRect(0, y - 1, SCREEN_WIDTH, 10, SH110X_WHITE);
+      display.setTextColor(SH110X_BLACK);
+    } else {
+      display.setTextColor(SH110X_WHITE);
+    }
+
+    display.setCursor(0, y);
+    if (row == 0) {
+      display.print("Bod 1 tlak: ");
+      if (pressureCalEditingValue && pressureCalSelectedRow == row) {
+        display.fillRect(71, y - 1, 24, 10, SH110X_WHITE);
+        display.setTextColor(SH110X_BLACK);
+        display.setCursor(72, y);
+      }
+      display.print(deciBarToString(pressureCalPoint1DeciBar));
+      display.print("b");
+    } else if (row == 1) {
+      display.print("Uloz B1 ADC: ");
+      if (pressureCalPoint1Adc >= 0) display.print(pressureCalPoint1Adc);
+      else display.print("---");
+    } else if (row == 2) {
+      display.print("Bod 2 tlak: ");
+      if (pressureCalEditingValue && pressureCalSelectedRow == row) {
+        display.fillRect(71, y - 1, 24, 10, SH110X_WHITE);
+        display.setTextColor(SH110X_BLACK);
+        display.setCursor(72, y);
+      }
+      display.print(deciBarToString(pressureCalPoint2DeciBar));
+      display.print("b");
+    } else if (row == 3) {
+      display.print("Uloz B2 ADC: ");
+      if (pressureCalPoint2Adc >= 0) display.print(pressureCalPoint2Adc);
+      else display.print("---");
+    }
+  }
+
+  display.setTextColor(SH110X_WHITE);
+  display.setCursor(0, 44);
+  display.print("ADC:");
+  display.print(pressureRawAdc);
+
+  if (pressureCalEditingValue) drawSoftkeys(bitmap_back, bitmap_minus, bitmap_plus, bitmap_ok);
+  else drawSoftkeys(bitmap_back, bitmap_arrowUp, bitmap_arrowDown, bitmap_ok);
+  display.display();
+}
+
 void drawSettingsScreen() {
   display.clearDisplay();
   display.setTextSize(1);
@@ -1284,7 +1518,7 @@ void drawSettingsScreen() {
   display.setCursor(6, 0);
   display.print("-NASTAVENI SYSTEMU-");
 
-  const int totalRows = 8;
+  const int totalRows = 11;
   const int visibleRows = 4;
   int firstRow = settingsSelectedRow - (visibleRows - 1);
   if (firstRow < 0) firstRow = 0;
@@ -1313,16 +1547,30 @@ void drawSettingsScreen() {
       display.print("Hlidat zahlceni: ");
       display.print(FLOOD_PROTECT_TIMEOUT_LABELS[floodProtectTimeoutIdx]);
     } else if (row == 3) {
+      display.print("Min. tlak: ");
+      display.print(deciBarToString(pressureLowThresholdDeciBar));
+      display.print(" bar");
+    } else if (row == 4) {
+      display.print("Vysoky tlak: ");
+      if (pressureHighThresholdDeciBar > 0) {
+        display.print(deciBarToString(pressureHighThresholdDeciBar));
+        display.print(" bar");
+      } else {
+        display.print("OFF");
+      }
+    } else if (row == 5) {
+      display.print("Kalibrace tlaku");
+    } else if (row == 6) {
       display.print("Tep. ochrana: ");
       display.print(TEMP_PROTECT_LIMIT_LABELS[tempProtectLimitIdx]);
-    } else if (row == 4) {
+    } else if (row == 7) {
       display.print("Informace");
-    } else if (row == 5) {
+    } else if (row == 8) {
       display.print("Nastavit cas");
-    } else if (row == 6) {
+    } else if (row == 9) {
       display.print("Prohodit cidla: ");
       display.print(tempSensorsSwap ? "ANO" : "NE");
-    } else if (row == 7) {
+    } else if (row == 10) {
       display.print("RESET CIDEL");
     }
   }
@@ -1341,20 +1589,40 @@ void drawInfoScreen() {
   display.setCursor(30, 0);
   display.print("-INFORMACE-");
 
-  display.setCursor(0, 14);
-  display.print(apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString());
+  if (infoPageIdx == 0) {
+    display.setCursor(0, 14);
+    display.print(apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString());
 
-  display.setCursor(0, 24);
-  display.print(WiFi.macAddress());
+    display.setCursor(0, 24);
+    display.print(WiFi.macAddress());
 
-  display.setCursor(0, 34);
-  if (apMode) {
-    display.print("PoolControlSetup");
+    display.setCursor(0, 34);
+    if (apMode) {
+      display.print("PoolControlSetup");
+    } else {
+      display.print(WiFi.SSID().length() > 0 ? WiFi.SSID() : "WIFI Nepripojena");
+    }
   } else {
-    display.print(WiFi.SSID().length() > 0 ? WiFi.SSID() : "WIFI Nepripojena");
+    display.setCursor(0, 18);
+    display.print("ADC: ");
+    display.print(pressureRawAdc);
+    display.setCursor(0, 30);
+    display.print("Tlak: ");
+    if (pressureCalibrationValid() && !isnan(pressureBar)) {
+      display.print(String(pressureBar, 2));
+      display.print(" bar");
+    } else {
+      display.print("nekalib.");
+    }
+    display.setCursor(0, 40);
+    display.print("Lo:");
+    display.print(deciBarToString(pressureLowThresholdDeciBar));
+    display.print(" Hi:");
+    if (pressureHighThresholdDeciBar > 0) display.print(deciBarToString(pressureHighThresholdDeciBar));
+    else display.print("OFF");
   }
 
-  drawSoftkeys(bitmap_back, bitmap_arrowRight, bitmap_arrowDown, nullptr);
+  drawSoftkeys(bitmap_back, bitmap_arrowRight, nullptr, nullptr);
   display.display();
 }
 
@@ -1389,6 +1657,8 @@ void updateDisplay() {
     drawTimerScreen();
   } else if (uiScreen == SCREEN_TIME_SET) {
     drawTimeSetScreen();
+  } else if (uiScreen == SCREEN_PRESSURE_CAL) {
+    drawPressureCalibrationScreen();
   } else if (uiScreen == SCREEN_SETTINGS) {
     drawSettingsScreen();
   } else if (uiScreen == SCREEN_INFO) {
@@ -1411,9 +1681,11 @@ String htmlPage() {
   s += "<p><b>Mode:</b> " + modeInfo + " | <b>IP:</b> " + ipInfo + "</p>";
   s += "<p><b>Time:</b> <span id='time'>--:--:--</span></p>";
   s += "<p><b>Teploty:</b> Voda <span id='water_temp'>N/A</span> | Cerpadlo <span id='pump_temp'>N/A</span></p>";
+  s += "<p><b>Tlak:</b> <span id='pressure_bar'>N/A</span> | <b>ADC:</b> <span id='pressure_adc'>---</span></p>";
   s += "<p><b>Relay:</b> <span id='relay'>?</span> | <b>Manual override:</b> <span id='manual_override'>?</span></p>";
   s += "<p><b>Timer:</b> <span id='timer_enabled'>?</span> | <b>Schedule:</b> <span id='schedule'>--:-- - --:--</span></p>";
-  s += "<p><b>Safety switch:</b> <span id='safety_ok'>?</span> | <b>Chyba:</b> <span id='fault'>zadna</span></p>";
+  s += "<p><b>Min. tlak:</b> <span id='pressure_low'>?</span> | <b>Vysoky tlak:</b> <span id='pressure_high'>?</span></p>";
+  s += "<p><b>Zaneseni pisku:</b> <span id='sand_warning'>?</span> | <b>Chyba:</b> <span id='fault'>zadna</span></p>";
   s += "<p><b>Hlidat zahlceni:</b> <span id='flood_protect'>?</span> | <b>Tep. ochrana:</b> <span id='temp_protect'>?</span></p>";
   s += "<hr>";
   s += "<h3>WiFi config</h3>";
@@ -1445,11 +1717,15 @@ String htmlPage() {
   s += "txt('time', s.time || '--:--:--');";
   s += "txt('water_temp', fmtTemp(s.water_temp_c, 1));";
   s += "txt('pump_temp', fmtTemp(s.pump_temp_c, 0));";
+  s += "txt('pressure_bar', fmtTemp(s.pressure_bar, 2).replace(' C',' bar'));";
+  s += "txt('pressure_adc', (s.pressure_adc===undefined||s.pressure_adc===null)?'---':String(s.pressure_adc));";
   s += "txt('relay', s.relay ? 'ON' : 'OFF');";
   s += "txt('manual_override', s.manual_override ? 'ON' : 'OFF');";
   s += "txt('timer_enabled', s.timer_enabled ? 'ON' : 'OFF');";
-  s += "txt('schedule', (s.schedule_on||'--:--') + ' - ' + (s.schedule_off||'--:--'));";
-  s += "txt('safety_ok', (s.safety_ok===true) ? 'OK' : 'OPEN');";
+  s += "txt('schedule', s.timer_enabled ? ((s.schedule_on||'--:--') + ' - ' + (s.schedule_off||'--:--')) : '-');";
+  s += "txt('pressure_low', s.pressure_low_bar>0 ? (s.pressure_low_bar.toFixed(1)+' bar') : 'OFF');";
+  s += "txt('pressure_high', s.pressure_high_bar>0 ? (s.pressure_high_bar.toFixed(1)+' bar') : 'OFF');";
+  s += "txt('sand_warning', s.sand_warning ? 'ANO' : 'NE');";
   s += "txt('fault', s.lockout_fault_label || 'zadna');";
   s += "txt('flood_protect', s.flood_protect_label || '?');";
   s += "txt('temp_protect', s.temp_protect_label || '?');";
@@ -1480,7 +1756,7 @@ void handleStatus() {
     lockoutLabel = "Prehrati cerpadla";
   }
 
-  bool safetyOk = (digitalRead(PIN_SAFETY_SWITCH) == LOW);
+  bool adequatePressure = hasAdequatePressure();
 
   String json = "{";
   json += "\"mode\":\"" + String(apMode ? "AP" : "STA") + "\",";
@@ -1490,12 +1766,18 @@ void handleStatus() {
   json += "\"temperature_c\":" + String(isnan(waterTempC) ? -999.0f : waterTempC, 2) + ",";
   json += "\"water_temp_c\":" + String(isnan(waterTempC) ? "null" : String(waterTempC, 2)) + ",";
   json += "\"pump_temp_c\":" + String(isnan(pumpTempC) ? "null" : String(pumpTempC, 2)) + ",";
+  json += "\"pressure_bar\":" + String(isnan(pressureBar) ? "null" : String(pressureBar, 3)) + ",";
+  json += "\"pressure_adc\":" + String(pressureRawAdc) + ",";
+  json += "\"pressure_low_bar\":" + String(pressureLowThresholdBar(), 1) + ",";
+  json += "\"pressure_high_bar\":" + String(pressureHighThresholdBar(), 1) + ",";
+  json += "\"pressure_calibrated\":" + String(pressureCalibrationValid() ? "true" : "false") + ",";
+  json += "\"sand_warning\":" + String(highPressureWarningActive() ? "true" : "false") + ",";
   json += "\"relay\":" + String(relayState ? "true" : "false") + ",";
   json += "\"manual_override\":" + String(manualOverride ? "true" : "false") + ",";
   json += "\"timer_enabled\":" + String(timerEnabled ? "true" : "false") + ",";
   json += "\"schedule_on\":\"" + timeHmString(schedOnHour, schedOnMinute) + "\",";
   json += "\"schedule_off\":\"" + timeHmString(schedOffHour, schedOffMinute) + "\",";
-  json += "\"safety_ok\":" + String(safetyOk ? "true" : "false") + ",";
+  json += "\"adequate_pressure\":" + String(adequatePressure ? "true" : "false") + ",";
   json += "\"lockout_fault\":\"" + lockoutKey + "\",";
   json += "\"lockout_fault_label\":\"" + lockoutLabel + "\",";
   json += "\"flood_protect_label\":\"" + String(FLOOD_PROTECT_TIMEOUT_LABELS[floodProtectTimeoutIdx]) + "\",";
@@ -1583,6 +1865,23 @@ void setupWebServer() {
   server.begin();
 }
 
+void setupOta() {
+  if (otaInitialized) return;
+
+  ArduinoOTA.setHostname("pool-controller");
+  ArduinoOTA.setPassword("123456");
+  ArduinoOTA.onStart([]() {
+    errorScreenFault = FAULT_NONE;
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.print("OTA error: ");
+    Serial.println((int)error);
+  });
+  ArduinoOTA.begin();
+  otaInitialized = true;
+  Serial.println("OTA ready: pool-controller");
+}
+
 void printAdcCalibration() {
 #if PRINT_ADC_CALIBRATION
   unsigned long now = millis();
@@ -1616,7 +1915,7 @@ void updateTemperature() {
 void setup() {
   pinMode(PIN_RELAY, OUTPUT);
   setRelay(false);
-  pinMode(PIN_SAFETY_SWITCH, INPUT_PULLUP);
+  pressureSensorPrepareInput();
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
@@ -1669,6 +1968,7 @@ void setup() {
   }
 
   setupWebServer();
+  setupOta();
   // Úspávání WiFi zvyšuje šum na ADC — pro klidnější žebřík tlačítek vypnout sleep.
   WiFi.setSleep(false);
   applyRelayLogic();
@@ -1678,9 +1978,11 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  if (otaInitialized) ArduinoOTA.handle();
   printAdcCalibration();
   updateButtons();
   updateTemperature();
+  updatePressure();
 
   if (!apMode && WiFi.status() != WL_CONNECTED) {
     if (millis() - lastWifiRetryMs > 15000) {
